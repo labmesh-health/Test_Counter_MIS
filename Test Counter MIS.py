@@ -94,9 +94,15 @@ if uploaded_file_1 and uploaded_file_2:
                 df_newer, df_older = df2_grouped, df1_grouped
                 new_date, old_date = date2, date1
 
-            # Merge and calculate differences
-            merged_df = pd.merge(df_newer, df_older, on="Test", suffixes=('_newer', '_older'))
+            # Outer join to find new/missing tests, fillna with 0
+            merged_df = pd.merge(
+                df_newer, df_older, on="Test", how="outer", suffixes=('_newer', '_older')
+            ).fillna(0)
+
+            # Ensure all counts are integers after fillna
             for col in agg_cols:
+                merged_df[f"{col}_newer"] = merged_df[f"{col}_newer"].astype(int)
+                merged_df[f"{col}_older"] = merged_df[f"{col}_older"].astype(int)
                 merged_df[f"{col}_diff"] = merged_df[f"{col}_newer"] - merged_df[f"{col}_older"]
 
             diff_display_cols = ["Test"] + [f"{col}_diff" for col in agg_cols]
