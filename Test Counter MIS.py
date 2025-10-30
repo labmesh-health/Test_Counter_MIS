@@ -65,8 +65,8 @@ def parse_test_counter(pdf_bytes):
 
 st.title("LAB MIS Instrument Test Counter Difference Calculator")
 
-uploaded_file_1 = st.sidebar.file_uploader("Upload first PDF report", type=["pdf"], key="file1")
-uploaded_file_2 = st.sidebar.file_uploader("Upload second PDF report", type=["pdf"], key="file2")
+uploaded_file_1 = st.sidebar.file_uploader("Upload yesterdays PDF report", type=["pdf"], key="file1")
+uploaded_file_2 = st.sidebar.file_uploader("Upload todays PDF report", type=["pdf"], key="file2")
 
 if uploaded_file_1 and uploaded_file_2:
     pdf_bytes1 = uploaded_file_1.read()
@@ -116,3 +116,4 @@ if uploaded_file_1 and uploaded_file_2:
 
 else:
     st.info("Please upload two PDF files in the sidebar to compare their test counters.")
+
