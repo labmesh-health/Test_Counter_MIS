@@ -6,7 +6,6 @@ from datetime import datetime
 from io import BytesIO
 import altair as alt
 
-# Styling and page setup
 STYLE = """
 <style>
 .rounded-box {
@@ -22,7 +21,6 @@ st.set_page_config(page_title="LAB MIS Dashboard", layout="wide")
 st.markdown(STYLE, unsafe_allow_html=True)
 
 def extract_date_from_text(text):
-    # Attempts to extract the first date/time in the first few lines of the PDF text
     for line in text.split('\n')[:6]:
         match = re.search(r'(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})', line)
         if match:
@@ -65,8 +63,8 @@ def parse_test_counter(pdf_bytes):
 
 st.title("LAB MIS Instrument Test Counter Difference Calculator")
 
-uploaded_file_1 = st.sidebar.file_uploader("Upload yesterdays PDF report", type=["pdf"], key="file1")
-uploaded_file_2 = st.sidebar.file_uploader("Upload todays PDF report", type=["pdf"], key="file2")
+uploaded_file_1 = st.sidebar.file_uploader("Upload first PDF report", type=["pdf"], key="file1")
+uploaded_file_2 = st.sidebar.file_uploader("Upload second PDF report", type=["pdf"], key="file2")
 
 if uploaded_file_1 and uploaded_file_2:
     pdf_bytes1 = uploaded_file_1.read()
@@ -79,29 +77,33 @@ if uploaded_file_1 and uploaded_file_2:
     if df1.empty or df2.empty:
         st.error("Test Counter data could not be found in one or both PDFs.")
     else:
+        # Aggregate (sum) counters with same test name
+        agg_cols = ["Routine", "Rerun", "STAT", "Calibrator", "QC", "Total Count"]
+        df1_grouped = df1.groupby("Test")[agg_cols].sum().reset_index()
+        df2_grouped = df2.groupby("Test")[agg_cols].sum().reset_index()
+
         date1 = df1["Date"].min()
         date2 = df2["Date"].min()
-        if date1 is None or date2 is None:
-            st.error("Unable to extract dates from the PDFs for comparison.")
-        else:
+
+        # Determine which file is newer
+        if date1 is not None and date2 is not None:
             if date1 > date2:
-                df_newer, df_older = df1, df2
+                df_newer, df_older = df1_grouped, df2_grouped
                 new_date, old_date = date1, date2
             else:
-                df_newer, df_older = df2, df1
+                df_newer, df_older = df2_grouped, df1_grouped
                 new_date, old_date = date2, date1
 
+            # Merge and calculate differences
             merged_df = pd.merge(df_newer, df_older, on="Test", suffixes=('_newer', '_older'))
-
-            diff_cols = ["Routine", "Rerun", "STAT", "Calibrator", "QC", "Total Count"]
-            for col in diff_cols:
+            for col in agg_cols:
                 merged_df[f"{col}_diff"] = merged_df[f"{col}_newer"] - merged_df[f"{col}_older"]
 
+            diff_display_cols = ["Test"] + [f"{col}_diff" for col in agg_cols]
             st.header(f"Test Counter Differences: {new_date.date()} minus {old_date.date()}")
-            diff_display_cols = ["Test"] + [f"{col}_diff" for col in diff_cols]
             st.dataframe(merged_df[diff_display_cols])
 
-            # Visualization of Total Count differences
+            # Chart
             base = alt.Chart(merged_df).mark_bar().encode(
                 x="Test:N",
                 y="Total Count_diff:Q",
@@ -113,7 +115,7 @@ if uploaded_file_1 and uploaded_file_2:
                 tooltip=["Test", "Total Count_diff"]
             )
             st.altair_chart(base, use_container_width=True)
-
+        else:
+            st.error("Unable to extract dates from the PDFs for comparison.")
 else:
     st.info("Please upload two PDF files in the sidebar to compare their test counters.")
-
