@@ -1,127 +1,197 @@
 import streamlit as st
-import pandas as pd
 import pdfplumber
+import pandas as pd
 import re
 from datetime import datetime
-from io import BytesIO
-import altair as alt
+import os
 
-STYLE = """
-<style>
-.rounded-box {
-    padding: 15px;
-    margin-bottom: 20px;
-    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
-    border-radius: 12px;
-    background-color: #fbfbfb;
-}
-</style>
-"""
-st.set_page_config(page_title="LAB MIS Dashboard", layout="wide")
-st.markdown(STYLE, unsafe_allow_html=True)
+# --- File Storage Names ---
+TEST_COUNTER_CSV = "test_counter_data.csv"
+SAMPLE_COUNTER_CSV = "sample_counter_data.csv"
+MC_COUNTER_CSV = "mc_counter_data.csv"
 
-def extract_date_from_text(text):
-    for line in text.split('\n')[:6]:
-        match = re.search(r'(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})', line)
-        if match:
-            date_str, time_str = match.groups()
-            try:
-                return datetime.strptime(f"{date_str} {time_str}", "%d/%m/%Y %H:%M")
-            except:
-                continue
+# --- Extraction Helpers ---
+
+def extract_date_from_page_text(text):
+    date_match = re.search(r'Date[:\s]+(\d{4}-\d{2}-\d{2})', text)
+    if date_match:
+        return datetime.strptime(date_match.group(1), '%Y-%m-%d').date()
+    else:
+        # Fallback: try to find any date pattern YYYY-MM-DD
+        date_match = re.search(r'(\d{4}-\d{2}-\d{2})', text)
+        if date_match:
+            return datetime.strptime(date_match.group(1), '%Y-%m-%d').date()
     return None
 
-def parse_test_counter(pdf_bytes):
-    headers = ["Test", "ACN", "Routine", "Rerun", "STAT", "Calibrator", "QC", "Total Count"]
-    pattern = r"Test\s+ACN\s+Routine\s+Rerun\s+STAT\s+Calibrator\s+QC\s+Total\s+Count"
-    rows = []
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+def find_table_by_header(tables, possible_headers):
+    """
+    Helper: Given list of pdfplumber-extracted tables, return index and table matching any of the possible_headers.
+    """
+    for i, t in enumerate(tables):
+        header = [col.strip().lower() for col in t[0]]
+        for ph in possible_headers:
+            if all(h.lower() in header for h in ph):
+                return i, t
+    return None, None
+
+def extract_tables_by_type(pdf_path):
+    """
+    Extracts Test Counter, Sample Counter, MC Counter tables into their own DataFrames
+    (appends all new data with date per page)
+    """
+    test_rows = []
+    sample_rows = []
+    mc_rows = []
+    with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             text = page.extract_text()
-            if not text:
-                continue
-            date = extract_date_from_text(text)
-            lines = text.split("\n")
-            for i, line in enumerate(lines):
-                if re.search(pattern, line, re.IGNORECASE):
-                    for data_line in lines[i+1:]:
-                        data_line = data_line.strip()
-                        if not data_line or data_line.lower().startswith(("total", "unit:", "system:")):
-                            break
-                        match = re.match(r'^(.*?)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$', data_line)
-                        if match:
-                            row_vals = list(match.groups())
-                            row_dict = dict(zip(headers, row_vals))
-                            row_dict["Date"] = date
-                            rows.append(row_dict)
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        for col in headers[2:]:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-        df["Date"] = pd.to_datetime(df["Date"])
-    return df
+            page_date = extract_date_from_page_text(text)
+            tables = page.extract_tables()
 
-st.title("LAB MIS Instrument Test Counter Difference Calculator")
+            # -- Test Counter (standard test table) --
+            tc_headers = [
+                ['Test', 'ACN', 'Routine', 'Rerun', 'STAT', 'Calibrator', 'QC', 'Total Count']
+            ]
+            i_tc, table_tc = find_table_by_header(tables, tc_headers)
+            if i_tc is not None:
+                df_tc = pd.DataFrame(table_tc[1:], columns=table_tc[0])
+                df_tc['Date'] = page_date
+                test_rows.append(df_tc)
 
-uploaded_file_1 = st.sidebar.file_uploader("Upload first PDF report", type=["pdf"], key="file1")
-uploaded_file_2 = st.sidebar.file_uploader("Upload second PDF report", type=["pdf"], key="file2")
+            # -- Sample Counter --
+            sc_headers = [
+                ['Unit:', 'Routine', 'Rerun', 'STAT', 'Total Count'],
+                ['Unit', 'Routine', 'Rerun', 'STAT', 'Total Count']
+            ]
+            i_sc, table_sc = find_table_by_header(tables, sc_headers)
+            if i_sc is not None:
+                df_sc = pd.DataFrame(table_sc[1:], columns=table_sc[0])
+                df_sc['Date'] = page_date
+                sample_rows.append(df_sc)
 
-if uploaded_file_1 and uploaded_file_2:
-    pdf_bytes1 = uploaded_file_1.read()
-    pdf_bytes2 = uploaded_file_2.read()
-    with st.spinner("Extracting Test Counter from first PDF..."):
-        df1 = parse_test_counter(pdf_bytes1)
-    with st.spinner("Extracting Test Counter from second PDF..."):
-        df2 = parse_test_counter(pdf_bytes2)
+            # -- Measuring Cells Counter --
+            mc_headers = [
+                ['Unit:', 'MC Serial No.', 'Last Reset', 'Count after Reset', 'Total Count'],
+                ['Unit', 'MC Serial No.', 'Last Reset', 'Count after Reset', 'Total Count']
+            ]
+            i_mc, table_mc = find_table_by_header(tables, mc_headers)
+            if i_mc is not None:
+                df_mc = pd.DataFrame(table_mc[1:], columns=table_mc[0])
+                df_mc['Date'] = page_date
+                mc_rows.append(df_mc)
 
-    if df1.empty or df2.empty:
-        st.error("Test Counter data could not be found in one or both PDFs.")
+    # Clean up and merge all frames
+    test_df = pd.concat(test_rows, ignore_index=True) if test_rows else pd.DataFrame()
+    sample_df = pd.concat(sample_rows, ignore_index=True) if sample_rows else pd.DataFrame()
+    mc_df = pd.concat(mc_rows, ignore_index=True) if mc_rows else pd.DataFrame()
+    return test_df, sample_df, mc_df
+
+def append_and_save(df, file):
+    if os.path.exists(file):
+        existing = pd.read_csv(file)
+        combined = pd.concat([existing, df], ignore_index=True).drop_duplicates()
     else:
-        # Aggregate (sum) counters with same test name
-        agg_cols = ["Routine", "Rerun", "STAT", "Calibrator", "QC", "Total Count"]
-        df1_grouped = df1.groupby("Test")[agg_cols].sum().reset_index()
-        df2_grouped = df2.groupby("Test")[agg_cols].sum().reset_index()
+        combined = df
+    combined.to_csv(file, index=False)
+    return combined
 
-        date1 = df1["Date"].min()
-        date2 = df2["Date"].min()
+# --- Streamlit UI ---
+st.set_page_config(page_title="Instrument Analysis", layout='wide')
+st.title("Instrument Counter Dashboard")
 
-        # Determine which file is newer
-        if date1 is not None and date2 is not None:
-            if date1 > date2:
-                df_newer, df_older = df1_grouped, df2_grouped
-                new_date, old_date = date1, date2
-            else:
-                df_newer, df_older = df2_grouped, df1_grouped
-                new_date, old_date = date2, date1
+# === Sidebar ===
+with st.sidebar:
+    st.header("Controls")
+    uploaded_file = st.file_uploader("Upload a PDF file", type=["pdf"])
 
-            # Outer join to find new/missing tests, fillna with 0
-            merged_df = pd.merge(
-                df_newer, df_older, on="Test", how="outer", suffixes=('_newer', '_older')
-            ).fillna(0)
+# --- Load persistent data ---
+def safe_load(file):
+    if os.path.exists(file):
+        return pd.read_csv(file)
+    else:
+        return pd.DataFrame()
 
-            # Ensure all counts are integers after fillna
-            for col in agg_cols:
-                merged_df[f"{col}_newer"] = merged_df[f"{col}_newer"].astype(int)
-                merged_df[f"{col}_older"] = merged_df[f"{col}_older"].astype(int)
-                merged_df[f"{col}_diff"] = merged_df[f"{col}_newer"] - merged_df[f"{col}_older"]
+test_counter_df = safe_load(TEST_COUNTER_CSV)
+sample_counter_df = safe_load(SAMPLE_COUNTER_CSV)
+mc_counter_df = safe_load(MC_COUNTER_CSV)
 
-            diff_display_cols = ["Test"] + [f"{col}_diff" for col in agg_cols]
-            st.header(f"Test Counter Differences: {new_date.date()} minus {old_date.date()}")
-            st.dataframe(merged_df[diff_display_cols])
+# --- Process PDF Upload ---
+if uploaded_file:
+    with open("temp_uploaded.pdf", "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    st.sidebar.success('File uploaded.')
+    tdf, sdf, mdf = extract_tables_by_type("temp_uploaded.pdf")
 
-            # Chart
-            base = alt.Chart(merged_df).mark_bar().encode(
-                x="Test:N",
-                y="Total Count_diff:Q",
-                color=alt.condition(
-                    alt.datum["Total Count_diff"] > 0,
-                    alt.value("green"),
-                    alt.value("red")
-                ),
-                tooltip=["Test", "Total Count_diff"]
-            )
-            st.altair_chart(base, use_container_width=True)
+    # Try converting numeric columns
+    for df in [tdf, sample_counter_df, sdf, mc_counter_df, mdf]:
+        numeric_cols = {'Total Count', 'Routine', 'STAT', 'Rerun', 'Count after Reset'}
+        for col in df.columns:
+            if col in numeric_cols:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # Update persistent CSV data
+    if not tdf.empty:
+        test_counter_df = append_and_save(tdf, TEST_COUNTER_CSV)
+    if not sdf.empty:
+        sample_counter_df = append_and_save(sdf, SAMPLE_COUNTER_CSV)
+    if not mdf.empty:
+        mc_counter_df = append_and_save(mdf, MC_COUNTER_CSV)
+
+tabs = st.tabs(["Graphs", "Tables"])
+
+# === Tab 1: Graphical Dashboards ===
+with tabs[0]:
+    st.header("Test Counter (Unit-wise Total)")
+    if not test_counter_df.empty:
+        st.write("Bar chart of unit-wise test total (latest date):")
+        latest_date = test_counter_df['Date'].max()
+        df_latest = test_counter_df[test_counter_df['Date'] == latest_date]
+        if 'Unit' in df_latest.columns and 'Total Count' in df_latest.columns:
+            st.bar_chart(df_latest.groupby('Unit')['Total Count'].sum())
         else:
-            st.error("Unable to extract dates from the PDFs for comparison.")
-else:
-    st.info("Please upload two PDF files in the sidebar to compare their test counters.")
+            st.write("Unit or Total Count column missing in extracted data.")
+    else:
+        st.info("No Test Counter data available.")
+
+    st.header("Sample Counter")
+    if not sample_counter_df.empty:
+        st.write("Sample Counter (latest date) by Unit:")
+        latest_date = sample_counter_df['Date'].max()
+        df_latest = sample_counter_df[sample_counter_df['Date'] == latest_date]
+        st.bar_chart(df_latest.set_index('Unit')['Total Count'])
+        # Optionally: Time series or more complex charts
+    else:
+        st.info("No Sample Counter table data found.")
+
+    st.header("Measuring Cells Counter")
+    if not mc_counter_df.empty:
+        st.write("Measuring Cells Counter (latest date) by Unit:")
+        latest_date = mc_counter_df['Date'].max()
+        df_latest = mc_counter_df[mc_counter_df['Date'] == latest_date]
+        st.bar_chart(df_latest.set_index('Unit')['Total Count'])
+    else:
+        st.info("No Measuring Cells Counter table data found.")
+
+# === Tab 2: Full Tables & Analysis ===
+with tabs[1]:
+    st.header("Select Dates for Test Counter Comparison")
+    if not test_counter_df.empty and 'Date' in test_counter_df.columns:
+        dates = sorted(test_counter_df['Date'].unique())
+        date1 = st.sidebar.selectbox("From date", dates, key="from_date")
+        date2 = st.sidebar.selectbox("To date", dates, key="to_date")
+        if date1 and date2 and date1 != date2:
+            df1 = test_counter_df[test_counter_df['Date'] == date1]
+            df2 = test_counter_df[test_counter_df['Date'] == date2]
+            diff = (df2.groupby('Unit')['Total Count'].sum() - df1.groupby('Unit')['Total Count'].sum()).reset_index()
+            diff.columns = ['Unit', f"Difference ({date2} - {date1})"]
+            st.subheader("Test Counter Difference by Unit")
+            st.dataframe(diff)
+        else:
+            st.info("Select two different dates for difference.")
+
+    st.subheader("Test Counter Table")
+    st.dataframe(test_counter_df)
+    st.subheader("Sample Counter Table")
+    st.dataframe(sample_counter_df)
+    st.subheader("Measuring Cells Counter Table")
+    st.dataframe(mc_counter_df)
