@@ -6,8 +6,8 @@ from datetime import datetime
 from io import BytesIO
 import altair as alt
 
-st.set_page_config(page_title="LAB MIS Full Debug", layout="wide")
-st.title("LAB MIS – Full Counter Parsing Debug")
+st.set_page_config(page_title="LAB MIS Full COL", layout="wide")
+st.title("LAB MIS – Cumulative Operations List Based")
 
 # ---------- helpers ----------
 def extract_date_from_text(text: str):
@@ -353,3 +353,4 @@ if uploaded_file:
 
 else:
     st.info("Upload the Detailed Test Counter PDF to see parsed tables.")
+
