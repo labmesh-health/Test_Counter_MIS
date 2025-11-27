@@ -6,6 +6,7 @@ from datetime import datetime
 from io import BytesIO
 import altair as alt
 
+# ---------- Styling ----------
 STYLE = """
 <style>
 .rounded-box {
@@ -20,45 +21,59 @@ STYLE = """
 st.set_page_config(page_title="LAB MIS Dashboard", layout="wide")
 st.markdown(STYLE, unsafe_allow_html=True)
 
+# ---------- Shared helpers ----------
 def extract_date_from_text(text):
     for line in text.split('\n')[:6]:
-        match = re.search(r'(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})', line)
-        if match:
-            date_str, time_str = match.groups()
+        m = re.search(r'(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})', line)
+        if m:
+            d, t = m.groups()
             try:
-                return datetime.strptime(f"{date_str} {time_str}", "%d/%m/%Y %H:%M")
-            except:
+                return datetime.strptime(f"{d} {t}", "%d/%m/%Y %H:%M")
+            except Exception:
                 continue
     return None
 
-def parse_table(pdf_bytes, headers, pattern, is_test_counter=False):
+def _split_head_text_numeric(line):
+    """Return (text_part, numeric_tokens_list) from a data line."""
+    tokens = re.split(r"\s+", line.strip())
+    num_start = None
+    for idx, tok in enumerate(tokens):
+        if re.fullmatch(r"[+-]?\d+", tok):
+            num_start = idx
+            break
+    if num_start is None:
+        return None, []
+    text_part = " ".join(tokens[:num_start]).strip()
+    nums = tokens[num_start:]
+    return text_part, nums
+
+# ---------- Flexible Test Counter ----------
+def parse_test_counter(pdf_bytes):
+    header_pattern = r"Test\s+ACN\s+Routine\s+Calib\.\s+QC\s+Rerun\s+STAT\s+Total\s+Count"
+    headers = ["Test", "ACN", "Routine", "Calib.", "QC", "Rerun", "STAT", "Total Count"]
+
     rows = []
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        for page_num, page in enumerate(pdf.pages):
-            text = page.extract_text()
-            if not text:
-                continue
+        for page in pdf.pages:
+            text = page.extract_text() or ""
             lines = text.split("\n")
-            current_unit = None
             date = extract_date_from_text(text)
+
             for i, line in enumerate(lines):
-                if re.search(pattern, line, re.IGNORECASE):
+                if re.search(header_pattern, line.strip()):
                     for data_line in lines[i+1:]:
-                        data_line = data_line.strip()
-                        if not data_line or data_line.lower().startswith(("total", "unit:", "system:")):
+                        dl = data_line.strip()
+                        if not dl or dl.lower().startswith(("total", "unit:", "system:")):
                             break
-                        if is_test_counter:
-                            match = re.match(r'^(.*?)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$', data_line)
-                            if match:
-                                row_vals = list(match.groups())
-                            else:
-                                continue
-                        else:
-                            row_vals = re.split(r"\s+", data_line)
-                        if len(row_vals) == len(headers):
-                            row_dict = dict(zip(headers, row_vals))
-                            row_dict["Date"] = date
-                            rows.append(row_dict)
+                        test_name, nums = _split_head_text_numeric(dl)
+                        if not test_name or len(nums) < 7:
+                            continue
+                        nums = nums[:7]
+                        vals = [test_name] + nums
+                        row = dict(zip(headers, vals))
+                        row["Date"] = date
+                        rows.append(row)
+
     df = pd.DataFrame(rows)
     if not df.empty:
         for col in df.columns:
@@ -66,21 +81,87 @@ def parse_table(pdf_bytes, headers, pattern, is_test_counter=False):
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
     return df
 
-def parse_test_counter(pdf_bytes):
-    headers = ["Test", "ACN", "Routine", "Rerun", "STAT", "Calibrator", "QC", "Total Count"]
-    pattern = r"Test\s+ACN\s+Routine\s+Rerun\s+STAT\s+Calibrator\s+QC\s+Total\s+Count"
-    return parse_table(pdf_bytes, headers, pattern, is_test_counter=True)
-
+# ---------- Flexible Sample Counter ----------
 def parse_sample_counter(pdf_bytes):
+    header_pattern = r"Unit:?\s+Routine\s+Rerun\s+STAT\s+Total\s+Count"
     headers = ["Unit", "Routine", "Rerun", "STAT", "Total Count"]
-    pattern = r"Unit[:]*\s*Routine\s+Rerun\s+STAT\s+Total\s+Count"
-    return parse_table(pdf_bytes, headers, pattern)
 
+    rows = []
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            lines = text.split("\n")
+            date = extract_date_from_text(text)
+
+            for i, line in enumerate(lines):
+                if re.search(header_pattern, line.strip(), re.IGNORECASE):
+                    for data_line in lines[i+1:]:
+                        dl = data_line.strip()
+                        if not dl or dl.lower().startswith(("total", "unit:", "system:")):
+                            break
+                        unit_text, nums = _split_head_text_numeric(dl)
+                        if not unit_text or len(nums) < 4:
+                            continue
+                        nums = nums[:4]
+                        vals = [unit_text] + nums
+                        row = dict(zip(headers, vals))
+                        row["Date"] = date
+                        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        for col in df.columns:
+            if col not in ["Date", "Unit"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    return df
+
+# ---------- Flexible Measuring Cells Counter ----------
 def parse_mc_counter(pdf_bytes):
-    headers = ["Unit", "MC Serial No.", "Last Reset", "Count after Reset", "Total Count"]
-    pattern = r"Unit[:]*\s*MC Serial No\.\s+Last Reset\s+Count after Reset\s+Total Count"
-    return parse_table(pdf_bytes, headers, pattern)
+    header_pattern = r"Unit:?\s+Count\s+after\s+Reset\s+Total\s+Count\s+MC\s+Serial\s+No\.\s+Last\s+Reset"
+    headers = ["Unit", "Count after Reset", "Total Count", "MC Serial No.", "Last Reset"]
 
+    rows = []
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            text = pdf.pages[page.page_number-1].extract_text() or ""
+            lines = text.split("\n")
+            date = extract_date_from_text(text)
+
+            for i, line in enumerate(lines):
+                if re.search(header_pattern, line.strip(), re.IGNORECASE):
+                    for data_line in lines[i+1:]:
+                        dl = data_line.strip()
+                        if (not dl or
+                            dl.lower().startswith(("electrodes", "unit:", "system:", "total"))):
+                            break
+                        tokens = re.split(r"\s+", dl)
+                        if len(tokens) < 4:
+                            continue
+                        unit = tokens[0]
+                        nums = []
+                        idx = 1
+                        while idx < len(tokens) and len(nums) < 3:
+                            if re.fullmatch(r"[+-]?\d+", tokens[idx]):
+                                nums.append(tokens[idx])
+                            else:
+                                break
+                            idx += 1
+                        if len(nums) < 3:
+                            continue
+                        last_reset = " ".join(tokens[idx:]).strip()
+                        vals = [unit] + nums + [last_reset]
+                        row = dict(zip(headers, vals))
+                        row["Date"] = date
+                        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        for col in df.columns:
+            if col not in ["Date", "Unit", "MC Serial No.", "Last Reset"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    return df
+
+# ---------- Streamlit UI (same as before, just using new parsers) ----------
 st.title("LAB MIS Instrument Counters")
 
 uploaded_file = st.sidebar.file_uploader("Upload your PDF report", type=["pdf"])
@@ -102,10 +183,12 @@ def setup_filters(df, name):
     df["Date"] = pd.to_datetime(df["Date"]).dt.date
     min_date = df["Date"].min()
     max_date = df["Date"].max()
-    date_range = st.sidebar.date_input(f"{name} Date Range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
+    date_range = st.sidebar.date_input(f"{name} Date Range", value=(min_date, max_date),
+                                       min_value=min_date, max_value=max_date)
     all_units = sorted(df["Unit"].dropna().unique()) if "Unit" in df.columns else []
     options = ["All"] + all_units if all_units else ["All"]
-    selected_unit = st.sidebar.selectbox(f"{name} Unit", options=options, index=0, key=f"{name.replace(' ', '_')}_unit")
+    selected_unit = st.sidebar.selectbox(f"{name} Unit", options=options, index=0,
+                                         key=f"{name.replace(' ', '_')}_unit")
     return date_range, selected_unit
 
 test_date_range, test_unit = setup_filters(test_df, "Test Counter") if not test_df.empty else (None, "All")
@@ -131,8 +214,8 @@ tabs = st.tabs(["Test Counter", "Sample Counter", "Measuring Cells Counter", "Do
 
 with tabs[0]:
     st.header("Test Counter Data")
-    columns_to_show = ["Test", "Routine", "Rerun", "STAT", "Calibrator", "QC", "Total Count"]
-    final_test_df = filtered_test[columns_to_show] if not filtered_test.empty else pd.DataFrame()
+    cols_test = ["Test", "Routine", "Calib.", "QC", "Rerun", "STAT", "Total Count"]
+    final_test_df = filtered_test[cols_test] if not filtered_test.empty else pd.DataFrame()
     if not final_test_df.empty:
         with st.container():
             st.markdown('<div class="rounded-box">', unsafe_allow_html=True)
@@ -151,8 +234,8 @@ with tabs[0]:
 
 with tabs[1]:
     st.header("Sample Counter Data")
-    columns_to_show = ["Unit", "Routine", "Rerun", "STAT", "Total Count"]
-    final_sample_df = filtered_sample[columns_to_show] if not filtered_sample.empty else pd.DataFrame()
+    cols_sample = ["Unit", "Routine", "Rerun", "STAT", "Total Count"]
+    final_sample_df = filtered_sample[cols_sample] if not filtered_sample.empty else pd.DataFrame()
     if not final_sample_df.empty:
         with st.container():
             st.markdown('<div class="rounded-box">', unsafe_allow_html=True)
@@ -171,8 +254,8 @@ with tabs[1]:
 
 with tabs[2]:
     st.header("Measuring Cells Counter Data")
-    columns_to_show = ["Unit", "MC Serial No.", "Last Reset", "Count after Reset", "Total Count"]
-    final_mc_df = filtered_mc[columns_to_show] if not filtered_mc.empty else pd.DataFrame()
+    cols_mc = ["Unit", "MC Serial No.", "Last Reset", "Count after Reset", "Total Count"]
+    final_mc_df = filtered_mc[cols_mc] if not filtered_mc.empty else pd.DataFrame()
     if not final_mc_df.empty:
         with st.container():
             st.markdown('<div class="rounded-box">', unsafe_allow_html=True)
