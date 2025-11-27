@@ -1,197 +1,199 @@
 import streamlit as st
-import pdfplumber
 import pandas as pd
+import pdfplumber
 import re
 from datetime import datetime
-import os
+from io import BytesIO
+import altair as alt
 
-# --- File Storage Names ---
-TEST_COUNTER_CSV = "test_counter_data.csv"
-SAMPLE_COUNTER_CSV = "sample_counter_data.csv"
-MC_COUNTER_CSV = "mc_counter_data.csv"
+STYLE = """
+<style>
+.rounded-box {
+    padding: 15px;
+    margin-bottom: 20px;
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+    border-radius: 12px;
+    background-color: #fbfbfb;
+}
+</style>
+"""
+st.set_page_config(page_title="LAB MIS Dashboard", layout="wide")
+st.markdown(STYLE, unsafe_allow_html=True)
 
-# --- Extraction Helpers ---
-
-def extract_date_from_page_text(text):
-    date_match = re.search(r'Date[:\s]+(\d{4}-\d{2}-\d{2})', text)
-    if date_match:
-        return datetime.strptime(date_match.group(1), '%Y-%m-%d').date()
-    else:
-        # Fallback: try to find any date pattern YYYY-MM-DD
-        date_match = re.search(r'(\d{4}-\d{2}-\d{2})', text)
-        if date_match:
-            return datetime.strptime(date_match.group(1), '%Y-%m-%d').date()
+def extract_date_from_text(text):
+    for line in text.split('\n')[:6]:
+        match = re.search(r'(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})', line)
+        if match:
+            date_str, time_str = match.groups()
+            try:
+                return datetime.strptime(f"{date_str} {time_str}", "%d/%m/%Y %H:%M")
+            except:
+                continue
     return None
 
-def find_table_by_header(tables, possible_headers):
-    """
-    Helper: Given list of pdfplumber-extracted tables, return index and table matching any of the possible_headers.
-    """
-    for i, t in enumerate(tables):
-        header = [col.strip().lower() for col in t[0]]
-        for ph in possible_headers:
-            if all(h.lower() in header for h in ph):
-                return i, t
-    return None, None
-
-def extract_tables_by_type(pdf_path):
-    """
-    Extracts Test Counter, Sample Counter, MC Counter tables into their own DataFrames
-    (appends all new data with date per page)
-    """
-    test_rows = []
-    sample_rows = []
-    mc_rows = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
+def parse_table(pdf_bytes, headers, pattern, is_test_counter=False):
+    rows = []
+    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
             text = page.extract_text()
-            page_date = extract_date_from_page_text(text)
-            tables = page.extract_tables()
-
-            # -- Test Counter (standard test table) --
-            tc_headers = [
-                ['Test', 'ACN', 'Routine', 'Rerun', 'STAT', 'Calibrator', 'QC', 'Total Count']
-            ]
-            i_tc, table_tc = find_table_by_header(tables, tc_headers)
-            if i_tc is not None:
-                df_tc = pd.DataFrame(table_tc[1:], columns=table_tc[0])
-                df_tc['Date'] = page_date
-                test_rows.append(df_tc)
-
-            # -- Sample Counter --
-            sc_headers = [
-                ['Unit:', 'Routine', 'Rerun', 'STAT', 'Total Count'],
-                ['Unit', 'Routine', 'Rerun', 'STAT', 'Total Count']
-            ]
-            i_sc, table_sc = find_table_by_header(tables, sc_headers)
-            if i_sc is not None:
-                df_sc = pd.DataFrame(table_sc[1:], columns=table_sc[0])
-                df_sc['Date'] = page_date
-                sample_rows.append(df_sc)
-
-            # -- Measuring Cells Counter --
-            mc_headers = [
-                ['Unit:', 'MC Serial No.', 'Last Reset', 'Count after Reset', 'Total Count'],
-                ['Unit', 'MC Serial No.', 'Last Reset', 'Count after Reset', 'Total Count']
-            ]
-            i_mc, table_mc = find_table_by_header(tables, mc_headers)
-            if i_mc is not None:
-                df_mc = pd.DataFrame(table_mc[1:], columns=table_mc[0])
-                df_mc['Date'] = page_date
-                mc_rows.append(df_mc)
-
-    # Clean up and merge all frames
-    test_df = pd.concat(test_rows, ignore_index=True) if test_rows else pd.DataFrame()
-    sample_df = pd.concat(sample_rows, ignore_index=True) if sample_rows else pd.DataFrame()
-    mc_df = pd.concat(mc_rows, ignore_index=True) if mc_rows else pd.DataFrame()
-    return test_df, sample_df, mc_df
-
-def append_and_save(df, file):
-    if os.path.exists(file):
-        existing = pd.read_csv(file)
-        combined = pd.concat([existing, df], ignore_index=True).drop_duplicates()
-    else:
-        combined = df
-    combined.to_csv(file, index=False)
-    return combined
-
-# --- Streamlit UI ---
-st.set_page_config(page_title="Instrument Analysis", layout='wide')
-st.title("Instrument Counter Dashboard")
-
-# === Sidebar ===
-with st.sidebar:
-    st.header("Controls")
-    uploaded_file = st.file_uploader("Upload a PDF file", type=["pdf"])
-
-# --- Load persistent data ---
-def safe_load(file):
-    if os.path.exists(file):
-        return pd.read_csv(file)
-    else:
-        return pd.DataFrame()
-
-test_counter_df = safe_load(TEST_COUNTER_CSV)
-sample_counter_df = safe_load(SAMPLE_COUNTER_CSV)
-mc_counter_df = safe_load(MC_COUNTER_CSV)
-
-# --- Process PDF Upload ---
-if uploaded_file:
-    with open("temp_uploaded.pdf", "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    st.sidebar.success('File uploaded.')
-    tdf, sdf, mdf = extract_tables_by_type("temp_uploaded.pdf")
-
-    # Try converting numeric columns
-    for df in [tdf, sample_counter_df, sdf, mc_counter_df, mdf]:
-        numeric_cols = {'Total Count', 'Routine', 'STAT', 'Rerun', 'Count after Reset'}
+            if not text:
+                continue
+            lines = text.split("\n")
+            current_unit = None
+            date = extract_date_from_text(text)
+            for i, line in enumerate(lines):
+                if re.search(pattern, line, re.IGNORECASE):
+                    for data_line in lines[i+1:]:
+                        data_line = data_line.strip()
+                        if not data_line or data_line.lower().startswith(("total", "unit:", "system:")):
+                            break
+                        if is_test_counter:
+                            match = re.match(r'^(.*?)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$', data_line)
+                            if match:
+                                row_vals = list(match.groups())
+                            else:
+                                continue
+                        else:
+                            row_vals = re.split(r"\s+", data_line)
+                        if len(row_vals) == len(headers):
+                            row_dict = dict(zip(headers, row_vals))
+                            row_dict["Date"] = date
+                            rows.append(row_dict)
+    df = pd.DataFrame(rows)
+    if not df.empty:
         for col in df.columns:
-            if col in numeric_cols:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
+            if col not in ["Date", "Test"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    return df
 
-    # Update persistent CSV data
-    if not tdf.empty:
-        test_counter_df = append_and_save(tdf, TEST_COUNTER_CSV)
-    if not sdf.empty:
-        sample_counter_df = append_and_save(sdf, SAMPLE_COUNTER_CSV)
-    if not mdf.empty:
-        mc_counter_df = append_and_save(mdf, MC_COUNTER_CSV)
+def parse_test_counter(pdf_bytes):
+    headers = ["Test", "ACN", "Routine", "Rerun", "STAT", "Calibrator", "QC", "Total Count"]
+    pattern = r"Test\s+ACN\s+Routine\s+Rerun\s+STAT\s+Calibrator\s+QC\s+Total\s+Count"
+    return parse_table(pdf_bytes, headers, pattern, is_test_counter=True)
 
-tabs = st.tabs(["Graphs", "Tables"])
+def parse_sample_counter(pdf_bytes):
+    headers = ["Unit", "Routine", "Rerun", "STAT", "Total Count"]
+    pattern = r"Unit[:]*\s*Routine\s+Rerun\s+STAT\s+Total\s+Count"
+    return parse_table(pdf_bytes, headers, pattern)
 
-# === Tab 1: Graphical Dashboards ===
+def parse_mc_counter(pdf_bytes):
+    headers = ["Unit", "MC Serial No.", "Last Reset", "Count after Reset", "Total Count"]
+    pattern = r"Unit[:]*\s*MC Serial No\.\s+Last Reset\s+Count after Reset\s+Total Count"
+    return parse_table(pdf_bytes, headers, pattern)
+
+st.title("LAB MIS Instrument Counters")
+
+uploaded_file = st.sidebar.file_uploader("Upload your PDF report", type=["pdf"])
+test_df = sample_df = mc_df = pd.DataFrame()
+
+if uploaded_file:
+    pdf_bytes = uploaded_file.read()
+    with st.spinner("Extracting Test Counter..."):
+        test_df = parse_test_counter(pdf_bytes)
+    with st.spinner("Extracting Sample Counter..."):
+        sample_df = parse_sample_counter(pdf_bytes)
+    with st.spinner("Extracting MC Counter..."):
+        mc_df = parse_mc_counter(pdf_bytes)
+
+def setup_filters(df, name):
+    if df.empty or "Date" not in df.columns or df["Date"].isnull().all():
+        st.sidebar.warning(f"No Date data in {name}")
+        return None, "All"
+    df["Date"] = pd.to_datetime(df["Date"]).dt.date
+    min_date = df["Date"].min()
+    max_date = df["Date"].max()
+    date_range = st.sidebar.date_input(f"{name} Date Range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
+    all_units = sorted(df["Unit"].dropna().unique()) if "Unit" in df.columns else []
+    options = ["All"] + all_units if all_units else ["All"]
+    selected_unit = st.sidebar.selectbox(f"{name} Unit", options=options, index=0, key=f"{name.replace(' ', '_')}_unit")
+    return date_range, selected_unit
+
+test_date_range, test_unit = setup_filters(test_df, "Test Counter") if not test_df.empty else (None, "All")
+sample_date_range, sample_unit = setup_filters(sample_df, "Sample Counter") if not sample_df.empty else (None, "All")
+mc_date_range, mc_unit = setup_filters(mc_df, "Measuring Cells") if not mc_df.empty else (None, "All")
+
+def apply_filters(df, date_range, unit):
+    if df.empty:
+        return df
+    start, end = date_range if date_range else (None, None)
+    filtered = df
+    if start and end:
+        filtered = filtered[(filtered["Date"] >= start) & (filtered["Date"] <= end)]
+    if "Unit" in df.columns and unit and unit != "All":
+        filtered = filtered[filtered["Unit"] == unit]
+    return filtered
+
+filtered_test = apply_filters(test_df, test_date_range, test_unit)
+filtered_sample = apply_filters(sample_df, sample_date_range, sample_unit)
+filtered_mc = apply_filters(mc_df, mc_date_range, mc_unit)
+
+tabs = st.tabs(["Test Counter", "Sample Counter", "Measuring Cells Counter", "Download"])
+
 with tabs[0]:
-    st.header("Test Counter (Unit-wise Total)")
-    if not test_counter_df.empty:
-        st.write("Bar chart of unit-wise test total (latest date):")
-        latest_date = test_counter_df['Date'].max()
-        df_latest = test_counter_df[test_counter_df['Date'] == latest_date]
-        if 'Unit' in df_latest.columns and 'Total Count' in df_latest.columns:
-            st.bar_chart(df_latest.groupby('Unit')['Total Count'].sum())
-        else:
-            st.write("Unit or Total Count column missing in extracted data.")
+    st.header("Test Counter Data")
+    columns_to_show = ["Test", "Routine", "Rerun", "STAT", "Calibrator", "QC", "Total Count"]
+    final_test_df = filtered_test[columns_to_show] if not filtered_test.empty else pd.DataFrame()
+    if not final_test_df.empty:
+        with st.container():
+            st.markdown('<div class="rounded-box">', unsafe_allow_html=True)
+            st.dataframe(final_test_df)
+            base = alt.Chart(final_test_df).mark_line(point=True).encode(
+                x="Test:N",
+                y="Total Count:Q",
+                color=alt.value("#1f77b4"),
+                tooltip=["Test", "Total Count"]
+            )
+            text = base.mark_text(align='center', baseline='bottom', dy=-5).encode(text='Total Count:Q')
+            st.altair_chart(base + text, use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
     else:
-        st.info("No Test Counter data available.")
+        st.info("No Test Counter data to display.")
 
-    st.header("Sample Counter")
-    if not sample_counter_df.empty:
-        st.write("Sample Counter (latest date) by Unit:")
-        latest_date = sample_counter_df['Date'].max()
-        df_latest = sample_counter_df[sample_counter_df['Date'] == latest_date]
-        st.bar_chart(df_latest.set_index('Unit')['Total Count'])
-        # Optionally: Time series or more complex charts
-    else:
-        st.info("No Sample Counter table data found.")
-
-    st.header("Measuring Cells Counter")
-    if not mc_counter_df.empty:
-        st.write("Measuring Cells Counter (latest date) by Unit:")
-        latest_date = mc_counter_df['Date'].max()
-        df_latest = mc_counter_df[mc_counter_df['Date'] == latest_date]
-        st.bar_chart(df_latest.set_index('Unit')['Total Count'])
-    else:
-        st.info("No Measuring Cells Counter table data found.")
-
-# === Tab 2: Full Tables & Analysis ===
 with tabs[1]:
-    st.header("Select Dates for Test Counter Comparison")
-    if not test_counter_df.empty and 'Date' in test_counter_df.columns:
-        dates = sorted(test_counter_df['Date'].unique())
-        date1 = st.sidebar.selectbox("From date", dates, key="from_date")
-        date2 = st.sidebar.selectbox("To date", dates, key="to_date")
-        if date1 and date2 and date1 != date2:
-            df1 = test_counter_df[test_counter_df['Date'] == date1]
-            df2 = test_counter_df[test_counter_df['Date'] == date2]
-            diff = (df2.groupby('Unit')['Total Count'].sum() - df1.groupby('Unit')['Total Count'].sum()).reset_index()
-            diff.columns = ['Unit', f"Difference ({date2} - {date1})"]
-            st.subheader("Test Counter Difference by Unit")
-            st.dataframe(diff)
-        else:
-            st.info("Select two different dates for difference.")
+    st.header("Sample Counter Data")
+    columns_to_show = ["Unit", "Routine", "Rerun", "STAT", "Total Count"]
+    final_sample_df = filtered_sample[columns_to_show] if not filtered_sample.empty else pd.DataFrame()
+    if not final_sample_df.empty:
+        with st.container():
+            st.markdown('<div class="rounded-box">', unsafe_allow_html=True)
+            st.dataframe(final_sample_df)
+            base = alt.Chart(final_sample_df).mark_bar().encode(
+                x="Unit:N",
+                y="Routine:Q",
+                color="Unit:N",
+                tooltip=["Unit", "Routine"]
+            )
+            text = base.mark_text(dy=-5, color='black').encode(text='Routine:Q')
+            st.altair_chart(base + text, use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+    else:
+        st.info("No Sample Counter data to display.")
 
-    st.subheader("Test Counter Table")
-    st.dataframe(test_counter_df)
-    st.subheader("Sample Counter Table")
-    st.dataframe(sample_counter_df)
-    st.subheader("Measuring Cells Counter Table")
-    st.dataframe(mc_counter_df)
+with tabs[2]:
+    st.header("Measuring Cells Counter Data")
+    columns_to_show = ["Unit", "MC Serial No.", "Last Reset", "Count after Reset", "Total Count"]
+    final_mc_df = filtered_mc[columns_to_show] if not filtered_mc.empty else pd.DataFrame()
+    if not final_mc_df.empty:
+        with st.container():
+            st.markdown('<div class="rounded-box">', unsafe_allow_html=True)
+            st.dataframe(final_mc_df)
+            base = alt.Chart(final_mc_df).mark_line(point=True).encode(
+                x="MC Serial No.:N",
+                y="Total Count:Q",
+                color="Unit:N",
+                tooltip=["Unit", "MC Serial No.", "Total Count"]
+            )
+            text = base.mark_text(align='center', baseline='bottom', dy=-5).encode(text='Total Count:Q')
+            st.altair_chart(base + text, use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+    else:
+        st.info("No Measuring Cells counter data to display.")
+
+with tabs[3]:
+    st.header("Download Data")
+    if not final_test_df.empty:
+        st.download_button("Download Test CSV", final_test_df.to_csv(index=False), "test_counter.csv")
+    if not final_sample_df.empty:
+        st.download_button("Download Sample CSV", final_sample_df.to_csv(index=False), "sample_counter.csv")
+    if not final_mc_df.empty:
+        st.download_button("Download MC CSV", final_mc_df.to_csv(index=False), "mc_counter.csv")
