@@ -47,12 +47,23 @@ def _split_head_text_numeric(line):
     nums = tokens[num_start:]
     return text_part, nums
 
-# ---------- Flexible Test Counter ----------
-def parse_test_counter(pdf_bytes):
-    header_pattern = r"Test\s+ACN\s+Routine\s+Calib\.\s+QC\s+Rerun\s+STAT\s+Total\s+Count"
-    headers = ["Test", "ACN", "Routine", "Calib.", "QC", "Rerun", "STAT", "Total Count"]
+def line_contains_words_in_order(line, words):
+    tokens = re.split(r"\s+", line.strip())
+    idx = 0
+    for w in words:
+        while idx < len(tokens) and tokens[idx] != w:
+            idx += 1
+        if idx == len(tokens):
+            return False
+        idx += 1
+    return True
 
+# ---------- Test Counter ----------
+def parse_test_counter(pdf_bytes):
+    headers = ["Test", "ACN", "Routine", "Calib.", "QC", "Rerun", "STAT", "Total Count"]
+    header_words = headers
     rows = []
+
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
@@ -60,7 +71,7 @@ def parse_test_counter(pdf_bytes):
             date = extract_date_from_text(text)
 
             for i, line in enumerate(lines):
-                if re.search(header_pattern, line.strip()):
+                if line_contains_words_in_order(line, header_words):
                     for data_line in lines[i+1:]:
                         dl = data_line.strip()
                         if not dl or dl.lower().startswith(("total", "unit:", "system:")):
@@ -69,8 +80,7 @@ def parse_test_counter(pdf_bytes):
                         if not test_name or len(nums) < 7:
                             continue
                         nums = nums[:7]
-                        vals = [test_name] + nums
-                        row = dict(zip(headers, vals))
+                        row = dict(zip(headers, [test_name] + nums))
                         row["Date"] = date
                         rows.append(row)
 
@@ -81,12 +91,12 @@ def parse_test_counter(pdf_bytes):
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
     return df
 
-# ---------- Flexible Sample Counter ----------
+# ---------- Sample Counter ----------
 def parse_sample_counter(pdf_bytes):
-    header_pattern = r"Unit:?\s+Routine\s+Rerun\s+STAT\s+Total\s+Count"
+    header_words = ["Unit:", "Routine", "Rerun", "STAT", "Total", "Count"]
     headers = ["Unit", "Routine", "Rerun", "STAT", "Total Count"]
-
     rows = []
+
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
@@ -94,7 +104,7 @@ def parse_sample_counter(pdf_bytes):
             date = extract_date_from_text(text)
 
             for i, line in enumerate(lines):
-                if re.search(header_pattern, line.strip(), re.IGNORECASE):
+                if line_contains_words_in_order(line, header_words):
                     for data_line in lines[i+1:]:
                         dl = data_line.strip()
                         if not dl or dl.lower().startswith(("total", "unit:", "system:")):
@@ -103,8 +113,7 @@ def parse_sample_counter(pdf_bytes):
                         if not unit_text or len(nums) < 4:
                             continue
                         nums = nums[:4]
-                        vals = [unit_text] + nums
-                        row = dict(zip(headers, vals))
+                        row = dict(zip(headers, [unit_text] + nums))
                         row["Date"] = date
                         rows.append(row)
 
@@ -115,20 +124,21 @@ def parse_sample_counter(pdf_bytes):
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
     return df
 
-# ---------- Flexible Measuring Cells Counter ----------
+# ---------- Measuring Cells Counter ----------
 def parse_mc_counter(pdf_bytes):
-    header_pattern = r"Unit:?\s+Count\s+after\s+Reset\s+Total\s+Count\s+MC\s+Serial\s+No\.\s+Last\s+Reset"
+    header_words = ["Unit:", "Count", "after", "Reset", "Total", "Count",
+                    "MC", "Serial", "No.", "Last", "Reset"]
     headers = ["Unit", "Count after Reset", "Total Count", "MC Serial No.", "Last Reset"]
-
     rows = []
+
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            text = pdf.pages[page.page_number-1].extract_text() or ""
+            text = page.extract_text() or ""
             lines = text.split("\n")
             date = extract_date_from_text(text)
 
             for i, line in enumerate(lines):
-                if re.search(header_pattern, line.strip(), re.IGNORECASE):
+                if line_contains_words_in_order(line, header_words):
                     for data_line in lines[i+1:]:
                         dl = data_line.strip()
                         if (not dl or
@@ -140,17 +150,17 @@ def parse_mc_counter(pdf_bytes):
                         unit = tokens[0]
                         nums = []
                         idx = 1
-                        while idx < len(tokens) and len(nums) < 3:
+                        while idx < len(tokens) and len(nums) < 2:
                             if re.fullmatch(r"[+-]?\d+", tokens[idx]):
                                 nums.append(tokens[idx])
                             else:
                                 break
                             idx += 1
-                        if len(nums) < 3:
+                        if len(nums) < 2 or idx >= len(tokens):
                             continue
-                        last_reset = " ".join(tokens[idx:]).strip()
-                        vals = [unit] + nums + [last_reset]
-                        row = dict(zip(headers, vals))
+                        mc_serial = tokens[idx]
+                        last_reset = " ".join(tokens[idx+1:]).strip()
+                        row = dict(zip(headers, [unit] + nums + [mc_serial, last_reset]))
                         row["Date"] = date
                         rows.append(row)
 
@@ -161,7 +171,7 @@ def parse_mc_counter(pdf_bytes):
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
     return df
 
-# ---------- Streamlit UI (same as before, just using new parsers) ----------
+# ---------- Streamlit UI ----------
 st.title("LAB MIS Instrument Counters")
 
 uploaded_file = st.sidebar.file_uploader("Upload your PDF report", type=["pdf"])
@@ -183,7 +193,8 @@ def setup_filters(df, name):
     df["Date"] = pd.to_datetime(df["Date"]).dt.date
     min_date = df["Date"].min()
     max_date = df["Date"].max()
-    date_range = st.sidebar.date_input(f"{name} Date Range", value=(min_date, max_date),
+    date_range = st.sidebar.date_input(f"{name} Date Range",
+                                       value=(min_date, max_date),
                                        min_value=min_date, max_value=max_date)
     all_units = sorted(df["Unit"].dropna().unique()) if "Unit" in df.columns else []
     options = ["All"] + all_units if all_units else ["All"]
